@@ -43,4 +43,18 @@ public abstract class Eventloop_Unsafe_Test {
         System.out.println("duration:" + duration + " ms");
     }
 
+    @Test
+    public void test_loop() {
+        AtomicInteger executedCount = new AtomicInteger();
+        int iterations = 10;
+        CountDownLatch completed = new CountDownLatch(1);
+
+        eventloop.offer(() -> eventloop.unsafe().loop(eventloop -> {
+            executedCount.incrementAndGet();
+            return executedCount.get() < iterations;
+        }).then((o,ex) -> completed.countDown()));
+
+        assertOpenEventually(completed);
+        assertEquals(executedCount.get(), iterations);
+    }
 }

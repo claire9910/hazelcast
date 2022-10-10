@@ -29,6 +29,8 @@ import org.jctools.queues.MpmcArrayQueue;
 import java.io.Closeable;
 import java.util.BitSet;
 import java.util.Collection;
+import java.util.Iterator;
+import java.util.List;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -41,6 +43,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Function;
 
 import static com.hazelcast.internal.nio.IOUtil.closeResources;
 import static com.hazelcast.internal.util.Preconditions.checkNotNull;
@@ -537,17 +540,19 @@ public abstract class Eventloop implements Executor {
             return Eventloop.this;
         }
 
+        public abstract AsyncFile newAsyncFile(String path);
+
+        public <E> Fut<E> newCompletedFuture(E value) {
+            Fut<E> fut = futAllocator.allocate();
+            fut.complete(value);
+            return fut;
+        }
+
         public <E> Fut<E> newFut() {
             return futAllocator.allocate();
         }
 
-        /**
-         * Offers a task to be scheduled on the eventloop.
-         *
-         * @param task the task to schedule.
-         * @return true if the task was accepted, false otherwise.
-         */
-        public boolean offer(Runnable task) {
+        public boolean execute(Runnable task) {
             return localRunQueue.offer(task);
         }
 
@@ -557,6 +562,57 @@ public abstract class Eventloop implements Executor {
             scheduledTask.fut = fut;
             scheduledTask.deadlineEpochNanos = epochNanos() + unit.toNanos(delay);
             scheduledTaskQueue.add(scheduledTask);
+            return fut;
+        }
+
+        public <I, O> Fut<List<O>> map(List<I> input, List<O> output, Function<I, O> function) {
+            Fut fut = newFut();
+
+            //todo: task can be pooled
+            Runnable task = new Runnable() {
+                Iterator<I> it = input.iterator();
+
+                @Override
+                public void run() {
+                    if (it.hasNext()) {
+                        I item = it.next();
+                        O result = function.apply(item);
+                        output.add(result);
+                    }
+
+                    if (it.hasNext()) {
+                        unsafe.execute(this);
+                    } else {
+                        fut.complete(output);
+                    }
+                }
+            };
+
+            execute(task);
+            return fut;
+        }
+
+        /**
+         * Keeps calling the loop function until it returns false.
+         *
+         * @param loopFunction the function that is called in a loop.
+         * @return the future that is completed as soon as the loop finishes.
+         */
+        public Fut loop(Function<Eventloop, Boolean> loopFunction) {
+            Fut fut = newFut();
+
+            //todo: task can be pooled
+            Runnable task = new Runnable() {
+                @Override
+                public void run() {
+                    if (loopFunction.apply(Eventloop.this)) {
+                        unsafe.execute(this);
+                    } else {
+                        fut.complete(null);
+                    }
+                }
+            };
+            execute(task);
             return fut;
         }
     }

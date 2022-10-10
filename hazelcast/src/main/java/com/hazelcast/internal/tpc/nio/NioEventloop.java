@@ -16,6 +16,7 @@
 
 package com.hazelcast.internal.tpc.nio;
 
+import com.hazelcast.internal.tpc.AsyncFile;
 import com.hazelcast.internal.tpc.Eventloop;
 import com.hazelcast.internal.networking.nio.SelectorOptimizer;
 
@@ -106,6 +107,10 @@ public final class NioEventloop extends Eventloop {
     }
 
     private class NioUnsafe extends Unsafe {
+        @Override
+        public AsyncFile newAsyncFile(String path) {
+            throw new RuntimeException("Not implemented");
+        }
     }
 
     /**

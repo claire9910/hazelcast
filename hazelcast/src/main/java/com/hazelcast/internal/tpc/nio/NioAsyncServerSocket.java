@@ -89,21 +89,20 @@ public final class NioAsyncServerSocket extends AsyncServerSocket {
 
     @Override
     public boolean isReusePort() {
-//        try {
-//            return serverSocketChannel.getOption(SO_REUSEPORT);
-//        } catch (IOException e) {
-//            throw new UncheckedIOException(e);
-//        }
-        return false;
+        try {
+            return serverSocketChannel.getOption(SO_REUSEPORT);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Override
     public void setReusePort(boolean reusePort) {
-//        try {
-//            serverSocketChannel.setOption(SO_REUSEPORT, reusePort);
-//        } catch (IOException e) {
-//            throw new UncheckedIOException(e);
-//        }
+        try {
+            serverSocketChannel.setOption(SO_REUSEPORT, reusePort);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Override

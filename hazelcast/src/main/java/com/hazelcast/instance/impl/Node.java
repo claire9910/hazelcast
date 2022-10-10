@@ -555,6 +555,11 @@ public class Node {
     }
 
     private void callGracefulShutdownAwareServices(final int maxWaitSeconds) {
+        if(true) {
+            return;
+        }
+
+
         ExecutorService executor = nodeEngine.getExecutionService().getExecutor(GRACEFUL_SHUTDOWN_EXECUTOR_NAME);
         Collection<GracefulShutdownAwareService> services = nodeEngine.getServices(GracefulShutdownAwareService.class);
         Collection<Future> futures = new ArrayList<Future>(services.size());

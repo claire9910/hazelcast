@@ -17,12 +17,21 @@
 package com.hazelcast.internal.tpc;
 
 import com.hazelcast.internal.util.ThreadAffinity;
+import com.hazelcast.internal.util.counters.SwCounter;
 import com.hazelcast.internal.util.executor.HazelcastManagedThread;
+import com.hazelcast.internal.tpc.epoll.EpollEventloop.EpollConfiguration;
+import com.hazelcast.internal.tpc.iouring.IOUringAsyncSocket;
+import com.hazelcast.internal.tpc.iouring.IOUringEventloop.IOUringConfiguration;
+import com.hazelcast.internal.tpc.nio.NioAsyncSocket;
 import com.hazelcast.internal.tpc.nio.NioEventloop;
+import com.hazelcast.internal.tpc.epoll.EpollEventloop;
+import com.hazelcast.internal.tpc.iouring.IOUringEventloop;
 import com.hazelcast.internal.tpc.nio.NioEventloop.NioConfiguration;
 import com.hazelcast.logging.ILogger;
 import com.hazelcast.logging.Logger;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +43,7 @@ import static com.hazelcast.internal.util.Preconditions.checkPositive;
 import static com.hazelcast.internal.tpc.TpcEngine.State.NEW;
 import static com.hazelcast.internal.tpc.TpcEngine.State.RUNNING;
 import static com.hazelcast.internal.tpc.TpcEngine.State.SHUTDOWN;
+import static java.lang.System.currentTimeMillis;
 import static java.lang.System.getProperty;
 
 /**
@@ -45,9 +55,11 @@ import static java.lang.System.getProperty;
 public final class TpcEngine {
 
     private final ILogger logger = Logger.getLogger(getClass());
+    private final boolean monitorSilent;
     private final Eventloop.Type eventloopType;
     private final int eventloopCount;
     private final Eventloop[] eventloops;
+    private final MonitorThread monitorThread;
     private final AtomicReference<State> state = new AtomicReference<>(NEW);
     final CountDownLatch terminationLatch;
 
@@ -67,7 +79,9 @@ public final class TpcEngine {
     public TpcEngine(Configuration cfg) {
         this.eventloopCount = cfg.eventloopCount;
         this.eventloopType = cfg.eventloopType;
+        this.monitorSilent = cfg.monitorSilent;
         this.eventloops = new Eventloop[eventloopCount];
+        this.monitorThread = new MonitorThread(eventloops, monitorSilent);
         this.terminationLatch = new CountDownLatch(eventloopCount);
 
         for (int idx = 0; idx < eventloopCount; idx++) {
@@ -79,6 +93,22 @@ public final class TpcEngine {
                     nioCfg.setThreadFactory(cfg.threadFactory);
                     cfg.eventloopConfigUpdater.accept(nioCfg);
                     eventloops[idx] = new NioEventloop(nioCfg);
+                    break;
+                case EPOLL:
+                    EpollConfiguration epollCfg = new EpollConfiguration();
+                    epollCfg.setThreadAffinity(cfg.threadAffinity);
+                    epollCfg.setThreadName("eventloop-" + idx);
+                    epollCfg.setThreadFactory(cfg.threadFactory);
+                    cfg.eventloopConfigUpdater.accept(epollCfg);
+                    eventloops[idx] = new EpollEventloop(epollCfg);
+                    break;
+                case IOURING:
+                    IOUringConfiguration ioUringCfg = new IOUringConfiguration();
+                    ioUringCfg.setThreadName("eventloop-" + idx);
+                    ioUringCfg.setThreadAffinity(cfg.threadAffinity);
+                    ioUringCfg.setThreadFactory(cfg.threadFactory);
+                    cfg.eventloopConfigUpdater.accept(ioUringCfg);
+                    eventloops[idx] = new IOUringEventloop(ioUringCfg);
                     break;
                 default:
                     throw new IllegalStateException("Unknown eventloopType:" + eventloopType);
@@ -159,6 +189,7 @@ public final class TpcEngine {
                 eventloop.start();
             }
 
+            monitorThread.start();
             return;
         }
     }
@@ -189,6 +220,8 @@ public final class TpcEngine {
                 default:
                     throw new IllegalStateException();
             }
+
+            monitorThread.shutdown();
 
             for (Eventloop eventloop : eventloops) {
                 eventloop.shutdown();
@@ -263,4 +296,161 @@ public final class TpcEngine {
         TERMINATED
     }
 
+    static private final class MonitorThread extends Thread {
+
+        private final Eventloop[] eventloops;
+        private final boolean silent;
+        private volatile boolean shutdown = false;
+        private long prevMillis = currentTimeMillis();
+        // There is a memory leak on the counters. When channels die, counters are not removed.
+        private final Map<SwCounter, LongHolder> prevMap = new HashMap<>();
+
+        private MonitorThread(Eventloop[] eventloops, boolean silent) {
+            super("MonitorThread");
+            this.eventloops = eventloops;
+            this.silent = silent;
+        }
+
+        static class LongHolder {
+            public long value;
+        }
+
+        @Override
+        public void run() {
+            try {
+                long nextWakeup = currentTimeMillis() + 5000;
+                while (!shutdown) {
+                    try {
+                        long now = currentTimeMillis();
+                        long remaining = nextWakeup - now;
+                        if (remaining > 0) {
+                            Thread.sleep(remaining);
+                        }
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+
+                    nextWakeup += 5000;
+
+                    long currentMillis = currentTimeMillis();
+                    long elapsed = currentMillis - prevMillis;
+                    this.prevMillis = currentMillis;
+
+                    for (Eventloop eventloop : eventloops) {
+                        //                    for (AsyncSocket socket : eventloop.resources()) {
+                        //                        monitor(socket, elapsed);
+                        //                    }
+                    }
+
+                    if (!silent) {
+                        for (Eventloop eventloop : eventloops) {
+                            monitor(eventloop, elapsed);
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+
+        private void monitor(Eventloop eventloop, long elapsed) {
+            //log(reactor + " request-count:" + reactor.requests.get());
+            //log(reactor + " channel-count:" + reactor.channels().size());
+
+            //        long requests = reactor.requests.get();
+            //        LongHolder prevRequests = getPrev(reactor.requests);
+            //        long requestsDelta = requests - prevRequests.value;
+            //log(reactor + " " + thp(requestsDelta, elapsed) + " requests/second");
+            //prevRequests.value = requests;
+            //
+            //        log("head-block:" + reactor.reactorQueue.head_block
+            //                + " tail:" + reactor.reactorQueue.tail.get()
+            //                + " dirtyHead:" + reactor.reactorQueue.dirtyHead.get()
+            //                + " cachedTail:" + reactor.reactorQueue.cachedTail);
+            ////
+        }
+
+        private void log(String s) {
+            System.out.println("[monitor] " + s);
+        }
+
+        private void monitor(AsyncSocket socket, long elapsed) {
+            long packetsRead = socket.ioBuffersRead.get();
+            LongHolder prevPacketsRead = getPrev(socket.ioBuffersRead);
+            long packetsReadDelta = packetsRead - prevPacketsRead.value;
+
+            if (!silent) {
+                log(socket + " " + thp(packetsReadDelta, elapsed) + " packets/second");
+
+                long bytesRead = socket.bytesRead.get();
+                LongHolder prevBytesRead = getPrev(socket.bytesRead);
+                long bytesReadDelta = bytesRead - prevBytesRead.value;
+                log(socket + " " + thp(bytesReadDelta, elapsed) + " bytes-read/second");
+                prevBytesRead.value = bytesRead;
+
+                long bytesWritten = socket.bytesWritten.get();
+                LongHolder prevBytesWritten = getPrev(socket.bytesWritten);
+                long bytesWrittenDelta = bytesWritten - prevBytesWritten.value;
+                log(socket + " " + thp(bytesWrittenDelta, elapsed) + " bytes-written/second");
+                prevBytesWritten.value = bytesWritten;
+
+                long handleOutboundCalls = socket.handleWriteCnt.get();
+                LongHolder prevHandleOutboundCalls = getPrev(socket.handleWriteCnt);
+                long handleOutboundCallsDelta = handleOutboundCalls - prevHandleOutboundCalls.value;
+                log(socket + " " + thp(handleOutboundCallsDelta, elapsed) + " handleOutbound-calls/second");
+                prevHandleOutboundCalls.value = handleOutboundCalls;
+
+                long readEvents = socket.readEvents.get();
+                LongHolder prevReadEvents = getPrev(socket.readEvents);
+                long readEventsDelta = readEvents - prevReadEvents.value;
+                log(socket + " " + thp(readEventsDelta, elapsed) + " read-events/second");
+                prevReadEvents.value = readEvents;
+
+                log(socket + " " + (packetsReadDelta * 1.0f / (handleOutboundCallsDelta + 1)) + " packets/handleOutbound-call");
+                log(socket + " " + (packetsReadDelta * 1.0f / (readEventsDelta + 1)) + " packets/read-events");
+                log(socket + " " + (bytesReadDelta * 1.0f / (readEventsDelta + 1)) + " bytes-read/read-events");
+            }
+            prevPacketsRead.value = packetsRead;
+
+            if (packetsReadDelta == 0 || true) {
+                if (socket instanceof NioAsyncSocket) {
+                    NioAsyncSocket c = (NioAsyncSocket) socket;
+                    boolean hasData = !c.unflushedBufs.isEmpty() || !c.ioVector.isEmpty();
+                    //if (nioChannel.flushThread.get() == null && hasData) {
+                    log(socket + " is stuck: unflushed-iobuffers:" + c.unflushedBufs.size()
+                            + " ioVector.empty:" + c.ioVector.isEmpty()
+                            + " flushed:" + c.flushThread.get()
+                            + " eventloop.contains:" + c.eventloop().concurrentRunQueue.contains(c));
+                    //}
+                } else if (socket instanceof IOUringAsyncSocket) {
+                    IOUringAsyncSocket c = (IOUringAsyncSocket) socket;
+                    boolean hasData = !c.unflushedBufs.isEmpty() || !c.ioVector.isEmpty();
+                    //if (c.flushThread.get() == null && hasData) {
+                    log(socket + " is stuck: unflushed-isbuffers:" + c.unflushedBufs.size()
+                            + " ioVector.empty:" + c.ioVector.isEmpty()
+                            + " flushed:" + c.flushThread.get()
+                            + " eventloop.contains:" + c.eventloop().concurrentRunQueue.contains(c));
+                    //}
+                }
+            }
+        }
+
+        private LongHolder getPrev(SwCounter counter) {
+            LongHolder prev = prevMap.get(counter);
+            if (prev == null) {
+                prev = new LongHolder();
+                prevMap.put(counter, prev);
+            }
+            return prev;
+        }
+
+        private static float thp(long delta, long elapsed) {
+            return (delta * 1000f) / elapsed;
+        }
+
+        private void shutdown() {
+            shutdown = true;
+            interrupt();
+        }
+    }
 }
